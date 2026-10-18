@@ -1,0 +1,405 @@
+name: clientfacing
+
+# =============================================
+# Client-Facing Agency Stack
+# =============================================
+# Infrastructure (shared, no duplicates):
+#   postgres  — one PG instance, multiple DBs
+#   mariadb   — BookStack only (requires MySQL)
+#   redis     — Chatwoot + n8n queue
+#   minio     — shared S3-compatible storage
+#   mailpit   — local email catch-all (dev only)
+#
+# App Services:
+#   chatwoot    :3300  — client support inbox
+#   documenso   :3301  — contracts & signatures
+#   metabase    :3302  — client dashboards
+#   bookstack   :3303  — docs & onboarding
+#   n8n         :5678  — automation engine
+#   worklenz    :3304  — project visibility (client-facing)
+#
+# Admin UIs:
+#   mailpit     :8025  — catch all emails in dev
+#   minio       :9001  — storage console
+# =============================================
+
+services:
+
+  # ==========================================
+  # INFRASTRUCTURE
+  # ==========================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cf-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cfadmin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cfadmin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  mariadb:
+    image: mariadb:11
+    container_name: cf-mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MYSQL_DATABASE: bookstack
+      MYSQL_USER: bookstack
+      MYSQL_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: cf-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: cf-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-cfminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"   # Console: http://localhost:9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: cf-mailpit
+    ports:
+      - "8025:8025"   # Web UI: http://localhost:8025
+      - "1025:1025"   # SMTP (internal services point here)
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # ==========================================
+  # APP SERVICES
+  # ==========================================
+
+  # --- Chatwoot: client support inbox ---
+  chatwoot:
+    image: chatwoot/chatwoot:latest
+    container_name: cf-chatwoot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE}
+      FRONTEND_URL: http://localhost:3300
+      DEFAULT_LOCALE: en
+      RAILS_ENV: production
+      FORCE_SSL: "false"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/chatwoot
+      REDIS_URL: redis://redis:6379
+      MAILER_SENDER_EMAIL: support@clientfacing.local
+      SMTP_ADDRESS: mailpit
+      SMTP_PORT: 1025
+      SMTP_ENABLE_STARTTLS_AUTO: "false"
+      SMTP_AUTHENTICATION: ""
+      # Storage — MinIO
+      ACTIVE_STORAGE_SERVICE: s3_compatible
+      S3_BUCKET_NAME: chatwoot
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-cfminio}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://minio:9000
+      FORCE_PATH_STYLE: "true"
+    ports:
+      - "3300:3000"
+    command: bundle exec rails s -p 3000 -b 0.0.0.0
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  chatwoot-worker:
+    image: chatwoot/chatwoot:latest
+    container_name: cf-chatwoot-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE}
+      FRONTEND_URL: http://localhost:3300
+      RAILS_ENV: production
+      FORCE_SSL: "false"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/chatwoot
+      REDIS_URL: redis://redis:6379
+      SMTP_ADDRESS: mailpit
+      SMTP_PORT: 1025
+      SMTP_ENABLE_STARTTLS_AUTO: "false"
+      SMTP_AUTHENTICATION: ""
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # --- Documenso: contracts & signatures ---
+  documenso:
+    image: documenso/documenso:latest
+    container_name: cf-documenso
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NEXTAUTH_SECRET: ${DOCUMENSO_NEXTAUTH_SECRET}
+      NEXTAUTH_URL: http://localhost:3301
+      NEXT_PUBLIC_WEBAPP_URL: http://localhost:3301
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/documenso
+      NEXT_PRIVATE_ENCRYPTION_KEY: ${DOCUMENSO_ENCRYPTION_KEY}
+      NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY: ${DOCUMENSO_ENCRYPTION_KEY_SECONDARY}
+      NEXT_PRIVATE_SMTP_HOST: mailpit
+      NEXT_PRIVATE_SMTP_PORT: "1025"
+      NEXT_PRIVATE_SMTP_FROM_ADDRESS: contracts@clientfacing.local
+      NEXT_PRIVATE_SMTP_FROM_NAME: "ClientFacing Contracts"
+      # Storage — MinIO
+      NEXT_PRIVATE_UPLOAD_TRANSPORT: s3
+      NEXT_PRIVATE_UPLOAD_ENDPOINT: http://minio:9000
+      NEXT_PRIVATE_UPLOAD_FORCE_PATH_STYLE: "true"
+      NEXT_PRIVATE_UPLOAD_REGION: us-east-1
+      NEXT_PRIVATE_UPLOAD_BUCKET: documenso
+      NEXT_PRIVATE_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-cfminio}
+      NEXT_PRIVATE_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "3301:3000"
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # --- Metabase: client dashboards & reporting ---
+  metabase:
+    image: metabase/metabase:latest
+    container_name: cf-metabase
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: ${POSTGRES_USER:-cfadmin}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_EMAIL_SMTP_HOST: mailpit
+      MB_EMAIL_SMTP_PORT: "1025"
+      MB_EMAIL_FROM_ADDRESS: reports@clientfacing.local
+      JAVA_OPTS: "-Xmx512m"
+    volumes:
+      - metabase_data:/metabase-data
+    ports:
+      - "3302:3000"
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # --- BookStack: client onboarding & SOPs ---
+  bookstack:
+    image: lscr.io/linuxserver/bookstack:latest
+    container_name: cf-bookstack
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: America/Chicago
+      APP_URL: http://localhost:3303
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      DB_USERNAME: bookstack
+      DB_PASSWORD: ${MARIADB_PASSWORD}
+      DB_DATABASE: bookstack
+      MAIL_DRIVER: smtp
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      MAIL_FROM: docs@clientfacing.local
+      MAIL_FROM_NAME: "ClientFacing Docs"
+    volumes:
+      - bookstack_data:/config
+    ports:
+      - "3303:80"
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # --- n8n: automation engine (internal, not client-facing) ---
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: cf-n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-cfadmin}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: "6379"
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678
+      GENERIC_TIMEZONE: America/Chicago
+      TZ: America/Chicago
+      N8N_EMAIL_MODE: smtp
+      N8N_SMTP_HOST: mailpit
+      N8N_SMTP_PORT: "1025"
+      N8N_SMTP_SENDER: n8n@clientfacing.local
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "5678:5678"
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  # --- Plane: project management (client + internal) ---
+  # Replaces Worklenz (no official images) — Plane covers both client-facing
+  # project visibility and internal sprint/product management.
+  plane-web:
+    image: makeplane/plane-frontend:stable
+    container_name: cf-plane-web
+    depends_on:
+      - plane-api
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:3304
+    ports:
+      - "3304:3000"
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  plane-api:
+    image: makeplane/plane-backend:stable
+    container_name: cf-plane-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ./bin/docker-entrypoint-api.sh
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/plane
+      REDIS_URL: redis://redis:6379
+      EMAIL_HOST: mailpit
+      EMAIL_PORT: "1025"
+      EMAIL_FROM: projects@clientfacing.local
+      DEFAULT_EMAIL: admin@clientfacing.local
+      DEFAULT_PASSWORD: ${PLANE_ADMIN_PASSWORD}
+      WEB_URL: http://localhost:3304
+      # Storage — MinIO
+      USE_MINIO: "1"
+      AWS_REGION: us-east-1
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-cfminio}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_S3_BUCKET_NAME: plane
+      MINIO_END_POINT: minio
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "0"
+      BUCKET_NAME: plane
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  plane-worker:
+    image: makeplane/plane-backend:stable
+    container_name: cf-plane-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ./bin/docker-entrypoint-worker.sh
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/plane
+      REDIS_URL: redis://redis:6379
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+  plane-beat:
+    image: makeplane/plane-backend:stable
+    container_name: cf-plane-beat
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ./bin/docker-entrypoint-beat.sh
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cfadmin}:${POSTGRES_PASSWORD}@postgres/plane
+      REDIS_URL: redis://redis:6379
+    networks:
+      - cf-net
+    restart: unless-stopped
+
+# ==========================================
+# VOLUMES (named, persisted across restarts)
+# ==========================================
+volumes:
+  postgres_data:
+  mariadb_data:
+  redis_data:
+  minio_data:
+  metabase_data:
+  bookstack_data:
+  n8n_data:
+
+networks:
+  cf-net:
+    driver: bridge
